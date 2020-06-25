@@ -83,6 +83,9 @@ var threadsMax int
 // the number of samples to collect for each benchmark record
 var samples int
 
+// a test mode to test write performances rather than read
+var writeTest bool
+
 // a test mode to find out when EC2 network throttling kicks in
 var throttlingMode bool
 
@@ -136,7 +139,8 @@ func parseFlags() {
 	cleanupArg := flag.Bool("cleanup", false, "Cleans all the objects uploaded to S3 for this test.")
 	csvResultsArg := flag.String("upload-csv", "", "Uploads the test results to S3 as a CSV file.")
 	createBucketArg := flag.Bool("create-bucket", true, "Create the bucket")
-	
+	writeArg := flag.Bool("write", false, "Run a write test rather than a read test.")
+
 	// parse the arguments and set all the global variables accordingly
 	flag.Parse()
 
@@ -160,6 +164,7 @@ func parseFlags() {
 	cleanupOnly = *cleanupArg
 	csvResults = *csvResultsArg
 	createBucket = *createBucketArg
+	writeTest = *writeArg
 
 	if payloadsMin > payloadsMax {
 		payloadsMin = payloadsMax
@@ -178,11 +183,10 @@ func parseFlags() {
 	}
 
 	if *throttlingModeArg {
-		// if running the network throttling test, the threads and payload arguments get overridden with these
+		// if running the network throttling test, the threads get overridden with these
+		// (HLA) let user define the payloads
 		threadsMin = 36
 		threadsMax = 36
-		payloadsMin = 15 // 16 MB
-		payloadsMax = 15 // 16 MB
 		throttlingMode = *throttlingModeArg
 	}
 }
@@ -240,72 +244,74 @@ func setup() {
 		// if the error is because the bucket already exists, ignore the error
 		if err != nil && !strings.Contains(err.Error(), "BucketAlreadyOwnedByYou:") {
 			panic("Failed to create S3 bucket: " + err.Error())
-		}	
+		}
 	}
 
-	// an object size iterator that starts from 1 KB and doubles the size on every iteration
-	generatePayload := payloadSizeGenerator()
+	if !writeTest {
+		// an object size iterator that starts from 1 KB and doubles the size on every iteration
+		generatePayload := payloadSizeGenerator()
 
-	// loop over every payload size
-	for p := 1; p <= payloadsMax; p++ {
-		// get an object size from the iterator
-		objectSize := generatePayload()
+		// loop over every payload size
+		for p := 1; p <= payloadsMax; p++ {
+			// get an object size from the iterator
+			objectSize := generatePayload()
 
-		// ignore payloads smaller than the min argument
-		if p < payloadsMin {
-			continue
-		}
-
-		fmt.Printf("Uploading \033[1;33m%-s\033[0m objects\n", byteFormat(float64(objectSize)))
-
-		// create a progress bar
-		bar := progressbar.NewOptions(threadsMax-1, progressbar.OptionSetRenderBlankState(true))
-
-		// create an object for every thread, so that different threads don't download the same object
-		for t := 1; t <= threadsMax; t++ {
-			// increment the progress bar for each object
-			_ = bar.Add(1)
-
-			// generate an S3 key from the sha hash of the hostname, thread index, and object size
-			key := generateS3Key(hostname, t, objectSize)
-
-			// do a HeadObject request to avoid uploading the object if it already exists from a previous test run
-			headReq := s3Client.HeadObjectRequest(&s3.HeadObjectInput{
-				Bucket: aws.String(bucketName),
-				Key:    aws.String(key),
-			})
-
-			_, err := headReq.Send()
-
-			// if no error, then the object exists, so skip this one
-			if err == nil {
+			// ignore payloads smaller than the min argument
+			if p < payloadsMin {
 				continue
 			}
 
-			// if other error, exit
-			if err != nil && !strings.Contains(err.Error(), "NotFound:") {
-				panic("Failed to head S3 object: " + err.Error())
+			fmt.Printf("Uploading \033[1;33m%-s\033[0m objects\n", byteFormat(float64(objectSize)))
+
+			// create a progress bar
+			bar := progressbar.NewOptions(threadsMax-1, progressbar.OptionSetRenderBlankState(true))
+
+			// create an object for every thread, so that different threads don't download the same object
+			for t := 1; t <= threadsMax; t++ {
+				// increment the progress bar for each object
+				_ = bar.Add(1)
+
+				// generate an S3 key from the sha hash of the hostname, thread index, and object size
+				key := generateS3Key(hostname, t, objectSize)
+
+				// do a HeadObject request to avoid uploading the object if it already exists from a previous test run
+				headReq := s3Client.HeadObjectRequest(&s3.HeadObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(key),
+				})
+
+				_, err := headReq.Send()
+
+				// if no error, then the object exists, so skip this one
+				if err == nil {
+					continue
+				}
+
+				// if other error, exit
+				if err != nil && !strings.Contains(err.Error(), "NotFound:") {
+					panic("Failed to head S3 object: " + err.Error())
+				}
+
+				// generate empty payload
+				payload := make([]byte, objectSize)
+
+				// do a PutObject request to create the object
+				putReq := s3Client.PutObjectRequest(&s3.PutObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(key),
+					Body:   bytes.NewReader(payload),
+				})
+
+				_, err = putReq.Send()
+
+				// if the put fails, exit
+				if err != nil {
+					panic("Failed to put S3 object: " + err.Error())
+				}
 			}
 
-			// generate empty payload
-			payload := make([]byte, objectSize)
-
-			// do a PutObject request to create the object
-			putReq := s3Client.PutObjectRequest(&s3.PutObjectInput{
-				Bucket: aws.String(bucketName),
-				Key:    aws.String(key),
-				Body:   bytes.NewReader(payload),
-			})
-
-			_, err = putReq.Send()
-
-			// if the put fails, exit
-			if err != nil {
-				panic("Failed to put S3 object: " + err.Error())
-			}
+			fmt.Print("\n")
 		}
-
-		fmt.Print("\n")
 	}
 }
 
@@ -391,46 +397,72 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 				// start the timer to measure the first byte and last byte latencies
 				latencyTimer := time.Now()
 
-				// do the GetObject request
-				req := s3Client.GetObjectRequest(&s3.GetObjectInput{
-					Bucket: aws.String(bucketName),
-					Key:    aws.String(key),
-				})
+				var firstByte time.Duration
+				var lastByte time.Duration
 
-				resp, err := req.Send()
+				if writeTest {
+					payload := make([]byte, payloadSize)
 
-				// if a request fails, exit
-				if err != nil {
-					panic("Failed to get object: " + err.Error())
-				}
+					// do a PutObject request to create the object
+					req := s3Client.PutObjectRequest(&s3.PutObjectInput{
+						Bucket: aws.String(bucketName),
+						Key:    aws.String(key),
+						Body:   bytes.NewReader(payload),
+					})
 
-				// measure the first byte latency
-				firstByte := time.Now().Sub(latencyTimer)
+					// measure the first byte latency
+					firstByte = time.Now().Sub(latencyTimer)
 
-				// create a buffer to copy the S3 object body to
-				var buf = make([]byte, payloadSize)
+					_, err := req.Send()
 
-				// read the s3 object body into the buffer
-				size := 0
-				for {
-					n, err := resp.Body.Read(buf)
+					// measure the last byte latency
+					lastByte = time.Now().Sub(latencyTimer)
 
-					size += n
-
-					if err == io.EOF {
-						break
-					}
-
-					// if the streaming fails, exit
+					// if a request fails, exit
 					if err != nil {
-						panic("Error reading object body: " + err.Error())
+						panic("Failed to get object: " + err.Error())
 					}
+				} else {
+					// do the GetObject request
+					req := s3Client.GetObjectRequest(&s3.GetObjectInput{
+						Bucket: aws.String(bucketName),
+						Key:    aws.String(key),
+					})
+					resp, err := req.Send()
+
+					// if a request fails, exit
+					if err != nil {
+						panic("Failed to get object: " + err.Error())
+					}
+
+					// measure the first byte latency
+					firstByte = time.Now().Sub(latencyTimer)
+
+					// create a buffer to copy the S3 object body to
+					var buf = make([]byte, payloadSize)
+
+					// read the s3 object body into the buffer
+					size := 0
+					for {
+						n, err := resp.Body.Read(buf)
+
+						size += n
+
+						if err == io.EOF {
+							break
+						}
+
+						// if the streaming fails, exit
+						if err != nil {
+							panic("Error reading object body: " + err.Error())
+						}
+					}
+
+					_ = resp.Body.Close()
+
+					// measure the last byte latency
+					lastByte = time.Now().Sub(latencyTimer)
 				}
-
-				_ = resp.Body.Close()
-
-				// measure the last byte latency
-				lastByte := time.Now().Sub(latencyTimer)
 
 				// add the latency result to the results channel
 				results <- latency{FirstByte: firstByte, LastByte: lastByte}
@@ -545,7 +577,11 @@ func printHeader(objectSize uint64) {
 	}
 
 	// print the table header
-	fmt.Printf("Download performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
+	if writeTest{
+		fmt.Printf("Upload performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
+	}else{
+		fmt.Printf("Download performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
+	}
 	fmt.Println("                           +-------------------------------------------------------------------------------------------------+")
 	fmt.Println("                           |            Time to First Byte (ms)             |            Time to Last Byte (ms)              |")
 	fmt.Println("+---------+----------------+------------------------------------------------+------------------------------------------------+")
@@ -698,7 +734,7 @@ func payloadSizeGenerator() func() uint64 {
 // adjust the sample count for small instances and for low thread counts (so that the test doesn't take forever)
 func getTargetSampleCount(threads int, tasks int) int {
 	if instanceType == "" {
-		return minimumOf(50, tasks)
+		return minimumOf(250, tasks) // (HLA) update for PCI
 	}
 	if !strings.Contains(instanceType, "xlarge") && !strings.Contains(instanceType, "metal") {
 		return minimumOf(50, tasks)
