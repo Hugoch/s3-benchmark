@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -206,9 +207,15 @@ func setupS3Client() {
 		cfg.EndpointResolver = aws.ResolveWithEndpointURL(endpoint)
 	}
 
+	// disable SSL cert checking. This is DANGEROUS, and only valid for custom endpoint benchmark. Never use in prod
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
 	// set a 3-minute timeout for all S3 calls, including downloading the body
 	cfg.HTTPClient = &http.Client{
-		Timeout: time.Second * 180,
+		Timeout:   time.Second * 180,
+		Transport: tr,
 	}
 
 	// crete the S3 client
@@ -577,9 +584,9 @@ func printHeader(objectSize uint64) {
 	}
 
 	// print the table header
-	if writeTest{
+	if writeTest {
 		fmt.Printf("Upload performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
-	}else{
+	} else {
 		fmt.Printf("Download performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
 	}
 	fmt.Println("                           +-------------------------------------------------------------------------------------------------+")
